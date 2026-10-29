@@ -31,7 +31,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 
-const CONFIG_DIRECTORY: &str = ".koharu";
+const CONFIG_DIRECTORY: &str = "koharu";
+const LEGACY_CONFIG_DIRECTORY: &str = ".koharu";
 const CONFIG_FILE: &str = "config.toml";
 
 static MANAGER: OnceLock<Result<Arc<Manager>, String>> = OnceLock::new();
@@ -370,10 +371,29 @@ impl Manager {
     }
 }
 
-/// Returns the shared Koharu configuration path: `~/.koharu/config.toml`.
+/// Returns the shared Koharu configuration path.
+///
+/// Follows the XDG Base Directory Specification on Linux (`$XDG_CONFIG_HOME/koharu/config.toml`
+/// or `~/.config/koharu/config.toml`) and standard platform configuration directories on other OSes.
+/// For backward compatibility, if the configuration does not exist at the standard location but
+/// exists at `~/.koharu/config.toml`, the legacy path is returned.
 pub fn path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not determine the home directory")?;
-    Ok(home.join(CONFIG_DIRECTORY).join(CONFIG_FILE))
+    let config_dir = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .context("could not determine the configuration directory")?;
+    let home_dir = dirs::home_dir();
+    Ok(resolve_path(&config_dir, home_dir.as_deref()))
+}
+
+fn resolve_path(config_dir: &Path, home_dir: Option<&Path>) -> PathBuf {
+    let standard = config_dir.join(CONFIG_DIRECTORY).join(CONFIG_FILE);
+    if !standard.exists() {
+        let legacy = home_dir.map(|home| home.join(LEGACY_CONFIG_DIRECTORY).join(CONFIG_FILE));
+        if let Some(legacy) = legacy.filter(|path| path.is_file()) {
+            return legacy;
+        }
+    }
+    standard
 }
 
 /// Load or retrieve a live, process-wide top-level configuration section.
@@ -760,5 +780,56 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("already loaded"));
+    }
+
+    #[test]
+    fn path_succeeds_and_ends_with_config_toml() {
+        let p = path().unwrap();
+        assert!(p.ends_with(CONFIG_FILE));
+    }
+
+    #[test]
+    fn resolve_path_returns_standard_when_neither_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let home_dir = temp.path().join("home");
+
+        let resolved = resolve_path(&config_dir, Some(&home_dir));
+        assert_eq!(
+            resolved,
+            config_dir.join(CONFIG_DIRECTORY).join(CONFIG_FILE)
+        );
+    }
+
+    #[test]
+    fn resolve_path_returns_legacy_when_only_legacy_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let home_dir = temp.path().join("home");
+        let legacy = home_dir.join(LEGACY_CONFIG_DIRECTORY).join(CONFIG_FILE);
+
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "test = true\n").unwrap();
+
+        let resolved = resolve_path(&config_dir, Some(&home_dir));
+        assert_eq!(resolved, legacy);
+    }
+
+    #[test]
+    fn resolve_path_prefers_standard_when_both_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let home_dir = temp.path().join("home");
+        let standard = config_dir.join(CONFIG_DIRECTORY).join(CONFIG_FILE);
+        let legacy = home_dir.join(LEGACY_CONFIG_DIRECTORY).join(CONFIG_FILE);
+
+        fs::create_dir_all(standard.parent().unwrap()).unwrap();
+        fs::write(&standard, "standard = true\n").unwrap();
+
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "legacy = true\n").unwrap();
+
+        let resolved = resolve_path(&config_dir, Some(&home_dir));
+        assert_eq!(resolved, standard);
     }
 }
